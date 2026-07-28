@@ -48,3 +48,24 @@ matters.
 
 The bundle is a plain `.tgz` — review it before forwarding if your environment
 requires that.
+
+## check-storage.sh
+
+Focused triage for LINSTOR / Piraeus storage when PVCs will not provision.
+
+```bash
+export KUBECONFIG=/path/to/appliance.kubeconfig
+curl -fsSL https://raw.githubusercontent.com/nctiggy/palette-diag/main/check-storage.sh | bash
+```
+
+Prints a readable report (StorageClass parameters in full, PVC state and events,
+`linstor node/storage-pool/resource-group/resource/volume/error-reports`, the
+Piraeus operator CRs that declare storage pools, CSI logs, and the Palette pack
+desired-state) and writes a `.tgz`.
+
+Flags: `--pvc NS/NAME` to focus one claim, `--no-bundle` for terminal output only.
+
+On a single-node appliance the usual cause is a **resource group** whose
+PlaceCount exceeds the node count. Note that a StorageClass naming a
+`resourceGroup` drives *that* group — changing `DfltRscGrp` has no effect on it,
+and the group's own count wins over the class's `placementCount` once it exists.
