@@ -11,17 +11,22 @@
 #
 #   --pvc NS/NAME   focus on one claim (default: every non-Bound PVC)
 #   --no-bundle     terminal output only
+#   --upload URL    also upload the bundle
+#
+# curl runs with -k throughout: enterprise TLS interception re-signs traffic with
+# a corporate CA, so validating against the public chain fails.
 #
 # Read-only. No secret values are collected.
 # =============================================================================
 set +e +u
 umask 077
 
-FOCUS=""; DO_BUNDLE=1
+FOCUS=""; DO_BUNDLE=1; UP="${UP:-}"
 while [ $# -gt 0 ]; do
   case "$1" in
     --pvc) FOCUS="$2"; shift 2;;
     --no-bundle) DO_BUNDLE=0; shift;;
+    --upload) UP="$2"; shift 2;;
     -h|--help) grep '^#' "$0" 2>/dev/null | sed 's/^# \{0,1\}//'; exit 0;;
     *) shift;;
   esac
@@ -153,5 +158,14 @@ echo "StorageClass, or DfltRscGrp) with PlaceCount greater than the node count."
 if [ "$DO_BUNDLE" = 1 ]; then
   tar czf "$OUT" -C "$D" . 2>/dev/null
   echo; echo "bundle: $OUT"
+  if [ -n "$UP" ]; then
+    NAME="$(basename "$OUT")"
+    if curl -k -fsS -m 15 -o /dev/null "$UP/upload" 2>/dev/null; then
+      curl -k -fSs --upload-file "$OUT" "$UP/upload/$NAME" && echo "uploaded: $NAME"
+    else
+      echo "!! $UP not reachable from here - bundle kept at $OUT"
+      echo "   from a machine with egress:  curl -k -fSs --upload-file $OUT $UP/upload/$NAME"
+    fi
+  fi
 fi
 echo "###### END ######"

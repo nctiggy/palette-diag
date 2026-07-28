@@ -17,7 +17,10 @@
 #
 # QUICK START
 #     export KUBECONFIG=/path/to/appliance.kubeconfig
-#     curl -fsSL <script-url> | bash -s -- --upload https://<your-upload-host>
+#     curl -k -fsSL <script-url> | bash -s -- --upload https://<your-upload-host>
+#
+#   -k is used throughout: enterprise TLS interception re-signs traffic with a
+#   corporate CA, so validation against the public chain fails.
 #
 # OPTIONS  (when run as a file, or via:  curl -fsSL URL | bash -s -- ARGS)
 #     --kubeconfig PATH   explicit kubeconfig (otherwise $KUBECONFIG / default)
@@ -600,13 +603,13 @@ elif [ "$DO_UPLOAD" = 1 ]; then
   echo "== upload -> $UP =="
   NAME="$(basename "$OUT")"
   CHUNK=$((90 * 1024 * 1024))     # stay under Cloudflare's 100 MB body cap
-  if ! curl -fsS -m 15 -o /dev/null "$UP/upload" 2>/dev/null; then
+  if ! curl -k -fsS -m 15 -o /dev/null "$UP/upload" 2>/dev/null; then
     echo "!! upload endpoint $UP is not reachable from this machine."
     echo "   The bundle is complete and kept at: $OUT"
     echo "   Move it to a machine with egress and run:"
-    echo "     curl -fSs --upload-file $OUT $UP/upload/$NAME"
+    echo "     curl -k -fSs --upload-file $OUT $UP/upload/$NAME"
   elif [ "${SIZE:-0}" -le "$CHUNK" ]; then
-    curl -fSs --upload-file "$OUT" "$UP/upload/$NAME" && echo && echo "uploaded: $NAME"
+    curl -k -fSs --upload-file "$OUT" "$UP/upload/$NAME" && echo && echo "uploaded: $NAME"
   else
     SESSION="$(date +%s)-$$-${RANDOM}"
     PARTS=$(( (SIZE + CHUNK - 1) / CHUNK ))
@@ -616,11 +619,11 @@ elif [ "$DO_UPLOAD" = 1 ]; then
     i=0
     for p in "$T2"/part_*; do
       seq=$(printf '%06d' "$i")
-      curl -fSs --upload-file "$p" "$UP/upload/chunk/$SESSION/$seq" >/dev/null && \
+      curl -k -fSs --upload-file "$p" "$UP/upload/chunk/$SESSION/$seq" >/dev/null && \
         echo "  chunk $((i+1))/$PARTS"
       i=$((i+1))
     done
-    curl -fSs -X POST "$UP/upload/finish/$SESSION?name=$NAME&size=$SIZE" && echo && echo "uploaded: $NAME"
+    curl -k -fSs -X POST "$UP/upload/finish/$SESSION?name=$NAME&size=$SIZE" && echo && echo "uploaded: $NAME"
     rm -rf "$T2"
   fi
 fi
