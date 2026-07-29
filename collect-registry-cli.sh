@@ -144,6 +144,71 @@ if [ "$DO_MONGO" = 1 ]; then
   fi
 fi
 
+# ---------------------------------------------------------------- 15 projects + profiles
+# Your project/profile IDs are site-specific, so discover them rather than asking
+# anyone to go and look them up. Also flags which profiles carry a Helm-registry
+# layer, since those are the ones a stuck Helm sync will break.
+if [ "$DO_MONGO" = 1 ] && [ -n "$MP" ] && [ -n "$MPOD" ]; then
+  h "PROJECTS + CLUSTER PROFILES (discovered)"
+  mkdir -p "$D/15-profiles"
+  kubectl exec -n "$NS" "$MPOD" -c mongo -- mongosh --quiet -u root -p "$MP" \
+    --authenticationDatabase admin --eval '
+    db = db.getSiblingDB("hubbledb");
+    var projName = {}, regName = {}, regKind = {};
+    db.projects.find({},{ "metadata.name":1,"metadata.uid":1 }).forEach(function(p){
+      projName[p.metadata.uid] = p.metadata.name;
+    });
+    db.registries.find({},{ "metadata.name":1,"metadata.uid":1,"kind":1 }).forEach(function(r){
+      regName[r.metadata.uid] = r.metadata.name; regKind[r.metadata.uid] = r.kind;
+    });
+    print("=== PROJECTS ===");
+    Object.keys(projName).forEach(function(u){ print("  " + projName[u] + "   projectUid=" + u); });
+    print("");
+    print("=== CLUSTER PROFILES ===");
+    db.clusterprofiles.find({}).forEach(function(p){
+      var m = p.metadata || {}, a = p.aclmeta || {};
+      var pub = (p.spec && (p.spec.published || p.spec.draft)) || {};
+      var packs = pub.packs || [];
+      var helm = packs.filter(function(k){ return k.type === "helm" || k.type === "oci"; });
+      print("  ------------------------------------------------------");
+      print("  name       : " + m.name);
+      print("  profileUid : " + m.uid);
+      print("  projectUid : " + (a.projectUid || "(tenant scope)") +
+            "  (" + (projName[a.projectUid] || a.scope || "?") + ")");
+      print("  type/scope : " + (pub.type || "?") + " / " + (a.scope || "?"));
+      print("  packs      : " + packs.length);
+      packs.forEach(function(k){
+        var src = k.registryUid ? (regName[k.registryUid] || k.registryUid) : "(inline/manifest)";
+        print("     - " + k.name + "  v" + (k.version||k.tag) +
+              "  type=" + k.type + "  layer=" + k.layer + "  registry=" + src);
+      });
+      if (helm.length) {
+        helm.forEach(function(k){
+          print("  >>> HELM/OCI LAYER from registry \"" +
+                (regName[k.registryUid]||k.registryUid) + "\" (" + (regKind[k.registryUid]||"?") + ")");
+        });
+        // machine-readable pick line for the content-build re-run
+        print("AUTOPICK\t" + m.uid + "\t" + (a.projectUid||"") + "\t" + m.name);
+      }
+    });
+  ' 2>&1 | tee "$D/15-profiles/projects-and-profiles.txt" | grep -v '^AUTOPICK'
+
+  grep -a '^AUTOPICK' "$D/15-profiles/projects-and-profiles.txt" > "$D/15-profiles/.autopick" 2>/dev/null
+  sed -i '/^AUTOPICK/d' "$D/15-profiles/projects-and-profiles.txt" 2>/dev/null
+
+  if [ -s "$D/15-profiles/.autopick" ]; then
+    echo
+    echo ">>> Profiles above marked HELM/OCI LAYER are the ones a stuck Helm"
+    echo ">>> registry sync will break. To capture the content-build failure,"
+    echo ">>> re-run this script adding:"
+    while IFS="$(printf '\t')" read -r _ puid pruid pname; do
+      echo ">>>   # $pname"
+      echo ">>>   --api-key <KEY> --console-url https://<vip> --cli <path/to/palette> \\"
+      echo ">>>     --profile-id $puid${pruid:+ --project-id $pruid}"
+    done < "$D/15-profiles/.autopick"
+  fi
+fi
+
 # ---------------------------------------------------------------- 10 registry state (API)
 if [ -n "$API_KEY" ] && [ -n "$CONSOLE" ]; then
   h "REGISTRY SYNC STATE (API)"
@@ -184,6 +249,25 @@ for dep in spectrocluster spectrocluster-jobs spectrocluster-reconciler mgmt sys
   grep -aiE "$SYNC_RE" "$D/20-synclogs/$dep-full.log" 2>/dev/null \
     | tail -60 | tee "$D/20-synclogs/$dep-sync-filtered.log"
 done
+
+echo; echo "--- packsync panics (a panic mid-sync leaves inProgress=true forever) ---"
+grep -ah -A6 'panicked while watching packsync\|PANIC\|Panic recovered' "$D/20-synclogs/"*-full.log 2>/dev/null \
+  | head -40 | tee "$D/20-synclogs/panics.txt"
+PANICS=$(grep -ah 'panicked while watching packsync\|Panic recovered' "$D/20-synclogs/"*-full.log 2>/dev/null | wc -l | tr -d ' ')
+echo "panic occurrences: ${PANICS:-0}"
+
+echo; echo "--- beat manager register/deregister pairing ---"
+# A registry that was registered but never deregistered = the sync goroutine is
+# still holding it. That is the signature of a sync that never finished.
+grep -ah "beat manager: registered\|beat manager: deregistered" "$D/20-synclogs/"*-full.log 2>/dev/null \
+  | tee "$D/20-synclogs/beat-pairing.txt" | tail -20
+REG=$(grep -ah "beat manager: registered"   "$D/20-synclogs/"*-full.log 2>/dev/null | wc -l | tr -d ' ')
+DEREG=$(grep -ah "beat manager: deregistered" "$D/20-synclogs/"*-full.log 2>/dev/null | wc -l | tr -d ' ')
+echo "registered=${REG:-0}  deregistered=${DEREG:-0}"
+if [ "${REG:-0}" -gt "${DEREG:-0}" ] 2>/dev/null; then
+  echo ">>> $(( REG - DEREG )) registry sync(s) registered but never deregistered."
+  echo ">>> That sync goroutine never completed - matches a permanently 'in progress' registry."
+fi
 
 echo; echo "--- is the recovery scheduler actually scheduled? ---"
 grep -ah "registrySyncRecovery\|sync recovery scheduler" "$D/20-synclogs/"*-full.log 2>/dev/null | tail -20
@@ -236,6 +320,19 @@ if [ -d "$PW" ]; then
 else
   echo "!! no CLI workspace at $PW - the CLI may never have run as this user."
   echo "   If you ran it as another user or with -w, pass PALETTE_WORKSPACE=<dir>."
+fi
+
+# --- if no profile was named, use the one we discovered that has a Helm layer
+if [ -z "$PROFILE_ID" ] && [ -s "$D/15-profiles/.autopick" ]; then
+  PICK="$(head -1 "$D/15-profiles/.autopick")"
+  PROFILE_ID="$(printf '%s' "$PICK" | cut -f2)"
+  [ -z "$PROJECT_ID" ] && PROJECT_ID="$(printf '%s' "$PICK" | cut -f3)"
+  PICKNAME="$(printf '%s' "$PICK" | cut -f4)"
+  echo
+  echo ">>> no --profile-id given; auto-selected the discovered Helm-layer profile:"
+  echo ">>>   \"$PICKNAME\"  profile=$PROFILE_ID project=${PROJECT_ID:-<tenant>}"
+  NPICK=$(wc -l < "$D/15-profiles/.autopick")
+  [ "$NPICK" -gt 1 ] && echo ">>>   ($NPICK candidates found - pass --profile-id to choose a different one)"
 fi
 
 # --- reproduce the failure under trace logging
@@ -335,6 +432,8 @@ echo "registries    : $(cnt '^name ')"
 echo "stuck syncs   : $(cnt 'SYNC IS IN PROGRESS')"
 echo "orphaned      : $(cnt 'ORPHANED')"
 echo "blocked       : $(cnt 'BLOCKED')"
+echo "packsync panics: ${PANICS:-0}$([ "${PANICS:-0}" -gt 0 ] 2>/dev/null && echo '   <-- see 20-synclogs/panics.txt')"
+echo "beat register/dereg: ${REG:-0}/${DEREG:-0}$([ "${REG:-0}" -gt "${DEREG:-0}" ] 2>/dev/null && echo '   <-- UNPAIRED: a sync never finished')"
 echo "CLI           : ${CLI:-<not found>}"
 echo "CLI logs      : $(find "$D/30-cli/logs" -type f 2>/dev/null | wc -l) file(s)"
 echo "build re-run  : $([ -d "$D/30-cli/build-attempt" ] && echo yes || echo no)"
