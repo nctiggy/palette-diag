@@ -20,6 +20,14 @@
 #   --no-mongo                                  skip the MongoDB sync-state dump
 #   --no-upload                                 build the bundle only
 #
+# IF YOU RAN `palette content build` ON A DIFFERENT MACHINE than the appliance
+# (a build server, a workstation, a pipeline runner) its logs are on THAT
+# machine, not this one. Run this on the build machine as well — no kubeconfig
+# and no cluster access needed:
+#
+#   curl -fsSL https://raw.githubusercontent.com/nctiggy/palette-diag/main/collect-registry-cli.sh \
+#     | bash -s -- --cli-only --upload https://ge-upload.craigcloud.io
+#
 # Read-only apart from the optional content-build re-run, which writes only to a
 # temp directory. Credentials are redacted before the bundle is written.
 # curl uses -k throughout: enterprise TLS interception re-signs traffic.
@@ -28,7 +36,7 @@ set +e +u
 umask 077
 
 UP=""; API_KEY=""; CONSOLE=""; PROFILE_ID=""; PROJECT_ID=""; CLI=""
-DO_MONGO=1; DO_UPLOAD=1; ARCH="amd64"
+DO_MONGO=1; DO_UPLOAD=1; ARCH="amd64"; CLI_ONLY=0
 LOG_TAIL="${LOG_TAIL:-10000}"
 
 while [ $# -gt 0 ]; do
@@ -42,14 +50,17 @@ while [ $# -gt 0 ]; do
     --cli)          CLI="$2"; shift 2;;
     --arch)         ARCH="$2"; shift 2;;
     --no-mongo)     DO_MONGO=0; shift;;
+    --cli-only)     CLI_ONLY=1; DO_MONGO=0; shift;;
     --kubeconfig)   export KUBECONFIG="$2"; shift 2;;
     -h|--help)      grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0;;
     *) shift;;
   esac
 done
 
-command -v kubectl >/dev/null 2>&1 || { echo "FATAL: kubectl not on PATH"; exit 1; }
-kubectl cluster-info >/dev/null 2>&1 || { echo "FATAL: kubectl cannot reach the cluster (KUBECONFIG=${KUBECONFIG:-default})"; exit 1; }
+if [ "$CLI_ONLY" = 0 ]; then
+  command -v kubectl >/dev/null 2>&1 || { echo "FATAL: kubectl not on PATH. If this machine only ran the Palette CLI, use --cli-only"; exit 1; }
+  kubectl cluster-info >/dev/null 2>&1 || { echo "FATAL: kubectl cannot reach the cluster (KUBECONFIG=${KUBECONFIG:-default}). If this machine only ran the Palette CLI, use --cli-only"; exit 1; }
+fi
 
 TS="$(date -u +%Y%m%d-%H%M%SZ)"
 D="$(mktemp -d)"; OUT="/tmp/palette-registry-cli-$TS.tgz"
@@ -66,20 +77,21 @@ echo "collected by: $(whoami)@$(hostname 2>/dev/null)"
 
 # ---------------------------------------------------------------- 00 context
 h "CONTEXT"
+echo "mode: $([ "$CLI_ONLY" = 1 ] && echo 'CLI-ONLY (no cluster access)' || echo 'full (appliance + CLI)')"
 run date -u
 echo "local time: $(date)"
-run kubectl version
-cap "$D/00-context/nodes.txt"       kubectl get nodes -o wide
-cap "$D/00-context/appliance-version.txt" \
+[ "$CLI_ONLY" = 0 ] && run kubectl version
+[ "$CLI_ONLY" = 0 ] && cap "$D/00-context/nodes.txt"       kubectl get nodes -o wide
+[ "$CLI_ONLY" = 0 ] && cap "$D/00-context/appliance-version.txt" \
   kubectl get deploy -n "$NS" -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.template.spec.containers[0].image}{"\n"}{end}'
-echo "--- appliance image versions ---"
-kubectl get deploy -n "$NS" -o jsonpath='{range .items[*]}{.spec.template.spec.containers[0].image}{"\n"}{end}' 2>/dev/null \
+[ "$CLI_ONLY" = 0 ] && echo "--- appliance image versions ---"
+[ "$CLI_ONLY" = 0 ] && kubectl get deploy -n "$NS" -o jsonpath='{range .items[*]}{.spec.template.spec.containers[0].image}{"\n"}{end}' 2>/dev/null \
   | sed 's/.*://' | sort -u | tr '\n' ' '; echo
 
 # ---------------------------------------------------------------- 10 registry state (MongoDB)
 # Field paths verified against a live 4.9.8 appliance:
 #   helm -> status.helmSyncStatus   oci -> status.syncStatus   pack -> status.packSyncStatus
-if [ "$DO_MONGO" = 1 ]; then
+if [ "$DO_MONGO" = 1 ] && [ "$CLI_ONLY" = 0 ]; then
   h "REGISTRY SYNC STATE (MongoDB)"
   MP="$(kubectl get secret spectromongosecret -n "$NS" -o jsonpath='{.data.mongoRootPassword}' 2>/dev/null | base64 -d 2>/dev/null)"
   MPOD="$(kubectl get pods -n "$NS" -o name 2>/dev/null | grep -E 'mongo-[0-9]+$' | head -1 | sed 's|pod/||')"
@@ -237,6 +249,7 @@ fi
 # The sync machinery lives in three deployments. registrySyncRecovery (the
 # auto-healer) runs ONLY in spectrocluster-reconciler - the others log
 # "Skipping schedulling registrySyncRecovery, since Schdeuler not enabled".
+if [ "$CLI_ONLY" = 0 ]; then
 h "REGISTRY SYNC LOGS"
 SYNC_RE='helmregistry_service|registry_sync_beat_manager|spectrocluster_packsync_service|registrySyncRecovery|packsync|SyncHelmRegistries|syncDefaultRegistry|beat manager|sync recovery|InProgress|panic|Panic'
 
@@ -289,6 +302,8 @@ kubectl get pods -n "$NS" --no-headers 2>/dev/null | awk '$4>0 {print "  RESTART
 kubectl get pods -n "$NS" -o json 2>/dev/null \
   | grep -B4 -A2 'OOMKilled' | head -40
 
+fi   # end cluster-only sections
+
 # ---------------------------------------------------------------- 30 Palette CLI
 h "PALETTE CLI"
 
@@ -309,17 +324,65 @@ else
 fi
 
 # --- the CLI's own artefacts. palette.log is the single most useful file here.
-PW="${PALETTE_WORKSPACE:-$HOME/.palette}"
-echo; echo "--- CLI workspace: $PW ---"
-if [ -d "$PW" ]; then
-  ls -la "$PW" "$PW/logs" 2>/dev/null | tee "$D/30-cli/workspace-listing.txt"
-  cp -a "$PW/logs/." "$D/30-cli/logs/" 2>/dev/null
-  cp "$PW/palette.yaml" "$D/30-cli/palette.yaml" 2>/dev/null   # redacted below
-  cp "$PW/.version"     "$D/30-cli/cli-dot-version" 2>/dev/null
-  echo "collected $(find "$D/30-cli/logs" -type f 2>/dev/null | wc -l) log file(s)"
-else
-  echo "!! no CLI workspace at $PW - the CLI may never have run as this user."
-  echo "   If you ran it as another user or with -w, pass PALETTE_WORKSPACE=<dir>."
+# The CLI writes to $HOME/.palette, so a sudo/su run lands in /root/.palette and
+# a pipeline run lands in that service account's home. Search all of them.
+echo; echo "--- locating Palette CLI workspaces ---"
+CANDIDATES="${PALETTE_WORKSPACE:-} $HOME/.palette /root/.palette"
+for hd in /home/*/ /Users/*/; do CANDIDATES="$CANDIDATES ${hd}.palette"; done
+# last resort: a bounded search for the CLI's own config file
+CANDIDATES="$CANDIDATES $(find / -maxdepth 5 -name palette.yaml -path '*/.palette/*' 2>/dev/null \
+                            | sed 's|/palette.yaml$||' | head -10)"
+
+FOUND=0
+for PW in $CANDIDATES; do
+  [ -n "$PW" ] && [ -d "$PW" ] || continue
+  case " $SEEN " in *" $PW "*) continue;; esac
+  SEEN="$SEEN $PW"
+  FOUND=$((FOUND+1))
+  TAG="$(printf '%s' "$PW" | tr '/' '_' | sed 's/^_//')"
+  echo "  [$FOUND] $PW   (owner: $(stat -c '%U' "$PW" 2>/dev/null))"
+  mkdir -p "$D/30-cli/workspaces/$TAG"
+  { echo "path: $PW"; ls -la "$PW" "$PW/logs" 2>/dev/null; } \
+      > "$D/30-cli/workspaces/$TAG/listing.txt" 2>&1
+  cp -a "$PW/logs/."     "$D/30-cli/workspaces/$TAG/logs/" 2>/dev/null
+  cp    "$PW/palette.yaml" "$D/30-cli/workspaces/$TAG/palette.yaml" 2>/dev/null  # redacted below
+  cp    "$PW/.version"     "$D/30-cli/workspaces/$TAG/cli-dot-version" 2>/dev/null
+  N=$(find "$D/30-cli/workspaces/$TAG/logs" -type f 2>/dev/null | wc -l)
+  echo "      -> $N log file(s)"
+  # keep the primary one where the build re-run expects it
+  [ "$FOUND" = 1 ] && { PWMAIN="$PW"; mkdir -p "$D/30-cli/logs"; cp -a "$PW/logs/." "$D/30-cli/logs/" 2>/dev/null; }
+done
+
+CLILOGS=$(find "$D/30-cli/workspaces" -name '*.log' 2>/dev/null | wc -l)
+if [ "$FOUND" = 0 ] || [ "$CLILOGS" = 0 ]; then
+  cat <<'MISSING' | tee "$D/30-cli/ACTION-REQUIRED.txt"
+
+  *********************************************************************
+  *  NO PALETTE CLI LOGS FOUND ON THIS MACHINE                        *
+  *********************************************************************
+
+  `palette content build` writes its logs to the home directory of the
+  user that ran it - NOT to the appliance. If you ran the build from a
+  build server, a workstation or a pipeline runner, its logs are there.
+
+  On the machine where you actually ran `palette content build`, either:
+
+  (a) run this same script in CLI-only mode - no cluster access needed:
+
+      curl -fsSL https://raw.githubusercontent.com/nctiggy/palette-diag/main/collect-registry-cli.sh \
+        | bash -s -- --cli-only --upload https://ge-upload.craigcloud.io
+
+  (b) or just send these files by email:
+
+      ~/.palette/logs/palette.log      <-- the important one
+      ~/.palette/palette.yaml          <-- REMOVE the apiKey line first
+      ~/.palette/.version
+      the full terminal output of the failing command, ideally re-run as:
+          palette --log-level trace content build ...  2>&1 | tee build.log
+
+  If you ran the CLI under sudo, look in /root/.palette instead of ~/.
+
+MISSING
 fi
 
 # --- if no profile was named, use the one we discovered that has a Helm layer
@@ -365,7 +428,7 @@ if [ -n "$CLI" ] && [ -n "$PROFILE_ID" ] && [ -n "$API_KEY" ] && [ -n "$CONSOLE"
   tail -40 "$BD/build-full.log"
 
   # whatever the CLI wrote about itself during the run
-  cp -a "$PW/logs/." "$D/30-cli/logs/" 2>/dev/null
+  cp -a "${PWMAIN:-$HOME/.palette}/logs/." "$D/30-cli/logs/" 2>/dev/null
   find "$BD" -maxdepth 2 -type f -printf '%s\t%p\n' 2>/dev/null | sort -rn | head -20 \
       > "$D/30-cli/build-output-listing.txt"
   # don't ship the bundle itself, only its shape
@@ -395,6 +458,7 @@ if [ -n "$API_KEY" ] && [ -n "$CONSOLE" ]; then
 fi
 
 # ---------------------------------------------------------------- 40 cluster health
+if [ "$CLI_ONLY" = 1 ]; then echo; echo "(cluster health skipped - --cli-only)"; else
 h "CLUSTER HEALTH"
 cap "$D/40-cluster/pods-all.txt"   kubectl get pods -A -o wide
 cap "$D/40-cluster/events.txt"     kubectl get events -A --sort-by=.lastTimestamp
@@ -404,6 +468,8 @@ cap "$D/40-cluster/pvc.txt"        kubectl get pvc -A
 echo "--- pods not Running ---"
 kubectl get pods -A --no-headers 2>/dev/null \
   | awk '{split($3,a,"/"); if(($4!="Running"&&$4!="Completed")||a[1]!=a[2]) print "  "$0}'
+
+fi
 
 # ---------------------------------------------------------------- redact
 h "REDACTING"
@@ -427,15 +493,20 @@ h "SUMMARY"
 # grep -c exits 1 on zero matches, so count via a function rather than `|| echo ?`
 MSTATE="$D/10-registry/mongo-registry-state.txt"
 cnt(){ [ -f "$MSTATE" ] || { echo "n/a"; return; }; grep -c "$1" "$MSTATE" 2>/dev/null | head -1; }
-echo "appliance     : $(kubectl get deploy mgmt -n $NS -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null | sed 's/.*://')"
-echo "registries    : $(cnt '^name ')"
-echo "stuck syncs   : $(cnt 'SYNC IS IN PROGRESS')"
-echo "orphaned      : $(cnt 'ORPHANED')"
-echo "blocked       : $(cnt 'BLOCKED')"
-echo "packsync panics: ${PANICS:-0}$([ "${PANICS:-0}" -gt 0 ] 2>/dev/null && echo '   <-- see 20-synclogs/panics.txt')"
-echo "beat register/dereg: ${REG:-0}/${DEREG:-0}$([ "${REG:-0}" -gt "${DEREG:-0}" ] 2>/dev/null && echo '   <-- UNPAIRED: a sync never finished')"
+if [ "$CLI_ONLY" = 0 ]; then
+  echo "appliance     : $(kubectl get deploy mgmt -n $NS -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null | sed 's/.*://')"
+  echo "registries    : $(cnt '^name ')"
+  echo "stuck syncs   : $(cnt 'SYNC IS IN PROGRESS')"
+  echo "orphaned      : $(cnt 'ORPHANED')"
+  echo "blocked       : $(cnt 'BLOCKED')"
+  echo "packsync panics: ${PANICS:-0}$([ "${PANICS:-0}" -gt 0 ] 2>/dev/null && echo '   <-- see 20-synclogs/panics.txt')"
+  echo "beat register/dereg: ${REG:-0}/${DEREG:-0}$([ "${REG:-0}" -gt "${DEREG:-0}" ] 2>/dev/null && echo '   <-- UNPAIRED: a sync never finished')"
+else
+  echo "mode          : CLI-only (no appliance data in this bundle)"
+fi
 echo "CLI           : ${CLI:-<not found>}"
-echo "CLI logs      : $(find "$D/30-cli/logs" -type f 2>/dev/null | wc -l) file(s)"
+echo "CLI workspaces: ${FOUND:-0} found, $(find "$D/30-cli/workspaces" -name '*.log' 2>/dev/null | wc -l | tr -d ' ') log file(s)"
+[ -f "$D/30-cli/ACTION-REQUIRED.txt" ] && echo "  !! NO CLI LOGS - see 30-cli/ACTION-REQUIRED.txt; run with --cli-only on the build machine"
 echo "build re-run  : $([ -d "$D/30-cli/build-attempt" ] && echo yes || echo no)"
 
 grep -h '>>> ' "$D/10-registry/mongo-registry-state.txt" 2>/dev/null | sed 's/^/  /'
